@@ -1,6 +1,6 @@
 编码器前处理：
 
-<img src="D:\WXhistoire\xwechat_files\wxid_1rispibg30f722_ae69\temp\RWTemp\2025-10\9e20f478899dc29eb19741386f9343c8\65756467ba976702174650b9d1f76156.jpg" alt="65756467ba976702174650b9d1f76156" style="zoom: 33%;" />
+![image-20251101150915470](C:\Users\jerehw\AppData\Roaming\Typora\typora-user-images\image-20251101150915470.png)
 
 ---
 
