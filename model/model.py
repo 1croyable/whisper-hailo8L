@@ -9,93 +9,141 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-class Linear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype),
-        )
-    
-class InstanceNorm(nn.Module):
-    def __init__(self, n_state: int):
+class Linear(nn.Module):
+    """
+    4D Linear 层 (B, C, T, 1)
+    实质是 1x1 Conv2d：
+        输入通道 = in_features = C
+        输出通道 = out_features
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(n_state, affine=True, eps=1e-5)
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # 注意：权重是可训练参数（或可冻结后导出）
+        self.weight = nn.Parameter(
+            torch.empty(out_features, in_features, 1, 1)
+        )
+
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = in_features
+            bound = 1 / fan_in ** 0.5
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        x : (B, T, d_model)
+        输入:  x (B, C, T, 1)
+        输出:  (B, out_features, T, 1)
         """
-        # 转置并调整形状以适配 InstanceNorm2d
-        x = x.permute(0, 2, 1).unsqueeze(-1)  # (B, d_model, T, 1)
-        x = self.norm(x)                      # 应用 InstanceNorm
-        x = x.squeeze(-1).permute(0, 2, 1)    # 转回原始形状 (B, T, d_model)
-        return x
-    
-class MultiHeadAttention(nn.Module):
-    use_sdpa = True
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
 
+        return F.conv2d(x, self.weight, self.bias)
+
+class LayerNorm(nn.Module):
+    """
+    (B, C, T, 1) 输入的 LayerNorm 等价形式 (GroupNorm 实现)。
+    使用 GroupNorm(1, C) 在样本内部跨所有通道做归一化。
+    """
+    def __init__(self, n_state: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, n_state, eps=eps, affine=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (B, C, T, 1)
+        return: (B, C, T, 1)
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
+        return self.norm(x)
+    
+
+class MultiHeadAttention(nn.Module):
+    """
+    4D版本多头注意力，保持 (B, C, T, 1)
+    - 使用 φ(x)=silu(x)+1 代替 softmax
+    - 不含 permute、transpose、view
+    - 全部运算为 conv + mul + sum，可被 Hailo 编译
+    """
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
         self.n_head = n_head
+        self.n_state = n_state
+        self.d_head = n_state // n_head
+
+        # 用 1×1 Conv 表示线性映射
         self.query = Linear(n_state, n_state)
-        self.key = Linear(n_state, n_state, bias=False)
+        self.key   = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
-        self.out = Linear(n_state, n_state)
+        self.out   = Linear(n_state, n_state)
 
-    def forward(
-        self,
-        x: Tensor,
-    ):
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
+    # φ(x)：softmax 近似
+    def phi(self, x: Tensor) -> Tensor:
+        return F.silu(x) + 1.0
 
-        wv = self.qkv_attention(q, k, v)
-        return self.out(wv)
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (B, C, T, 1)
+        return: (B, C, T, 1)
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
 
-    def qkv_attention(
-        self, q: Tensor, k: Tensor, v: Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        n_batch, n_ctx, n_state = q.shape
-        scale = (n_state // self.n_head) ** -0.25
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        q = self.query(x)   # (B, C, T, 1)
+        k = self.key(x)     # (B, C, T, 1)
+        v = self.value(x)   # (B, C, T, 1)
 
-        q = q * scale
-        k = k * scale
+        # 注意力主体
+        out = self.qkv_attention(q, k, v)
+        return self.out(out)
 
-        def phi(x: Tensor) -> Tensor:
-            return F.silu(x) + 1
+    def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """
+        线性注意力 (kernel attention)
+        """
+        B, C, T, _ = q.shape
+        H = self.n_head
+        Dh = self.d_head
 
-        phi_q = phi(q)
-        phi_k = phi(k)
+        # 对 q,k 应用核函数
+        phi_q = self.phi(q)
+        phi_k = self.phi(k)
 
-        B, H, T, Dh = phi_q.shape
-        phi_q = phi_q.reshape(B * H, T, Dh)
-        phi_k = phi_k.reshape(B * H, T, Dh)
-        v = v.reshape(B * H, T, Dh)
+        # 分头 reshape
+        phi_q = phi_q.reshape(B, H, Dh, T, 1)
+        phi_k = phi_k.reshape(B, H, Dh, T, 1)
+        v = v.reshape(B, H, Dh, T, 1)
 
-        kv = phi_k.transpose(-2, -1) @ v
-        out = phi_q @ kv
+        # 分子：Σ_t φ(k_t) * v_t
+        num = torch.sum(phi_k * v, dim=3, keepdim=True) # (B,H,Dh,1,1)
 
-        out = out.reshape(B, H, T, Dh).permute(0, 2, 1, 3).flatten(start_dim=2)
+        # 分母：Σ_t φ(k_t)
+        den = torch.sum(phi_k, dim=3, keepdim=True) # (B,H,Dh,1,1)
+        den = den + 1e-6
 
-        return out
+        norm = phi_q * den
+        out = (phi_q * num) / norm # (B,H,Dh,T,1)
+
+        # 合并 heads → (B,C,T,1)
+        return out.reshape(B, C, T, 1)
     
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
 
         self.attn = MultiHeadAttention(n_state, n_head)
-        self.attn_ln = InstanceNorm(n_state)
+        self.attn_ln = LayerNorm(n_state)
 
         n_mlp = n_state * 4
         self.mlp = nn.Sequential(
             Linear(n_state, n_mlp), nn.SiLU(), Linear(n_mlp, n_state)
         )
-        self.mlp_ln = InstanceNorm(n_state)
+        self.mlp_ln = LayerNorm(n_state)
 
     def forward(
         self,
@@ -110,39 +158,65 @@ class AudioEncoder(nn.Module):
         self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
     ):
         super().__init__()
-        self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
 
+        # 第一层卷积：提升通道数 n_mels → n_state
+        self.conv1 = nn.Conv2d(
+            in_channels=n_mels,
+            out_channels=n_state,
+            kernel_size=(3, 1),
+            padding=(1, 0)
+        )
+
+        # 第二层卷积：时间降采样
+        self.conv2 = nn.Conv2d(
+            in_channels=n_state,
+            out_channels=n_state,
+            kernel_size=(3, 1),
+            stride=(2, 1),
+            padding=(1, 0)
+        )
+
+        # 残差注意力块
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
-        self.ln_post = InstanceNorm(n_state)
 
-    def forward(self, x: Tensor, pos_emb: Tensor):
+        # 归一化层仿照LayerNorm
+        self.ln_post = LayerNorm(n_state)
+
+    def forward(self, x: Tensor, pos_emb: Optional[Tensor] = None) -> Tensor:
         """
-        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
-            the mel spectrogram of the audio
+        x : (B, n_mels, T, 1)
+        pos_emb : (B, n_state, T, 1)
+        return : (B, n_state, T_out, 1)
         """
+        # 两层卷积特征提取
         x = F.silu(self.conv1(x))
-        x = F.silu(self.conv2(x))
-        
-        x = x.permute(0, 2, 1)
+        x = F.silu(self.conv2(x))  # (B, n_state, T/2, 1)
 
-        x = (x + pos_emb).to(x.dtype)
+        # 叠加位置编码
+        x = (x + pos_emb[..., :x.shape[2], :]).to(x.dtype)
 
+        # 注意力块
         for block in self.blocks:
-            x = block(x)
+            x = block(x)  # (B, n_state, T', 1)
 
-        x = self.ln_post(x)
-        return x
-    
+        # 最后归一化
+        return self.ln_post(x)
+
+
 class EncoderCTC(nn.Module):
     def __init__(self, encoder: AudioEncoder, vocab_size: int, n_state: int):
         super().__init__()
         self.encoder = encoder
-        self.ctc_linear = nn.Linear(n_state, vocab_size)
+        self.ctc_linear = Linear(n_state, vocab_size)
 
-    def forward(self, mel, pos_emb):
-        x = self.encoder(mel, pos_emb)
-        logits = self.ctc_linear(x)  # (B, T, vocab)
+    def forward(self, mel: Tensor, pos_emb: Optional[Tensor]) -> Tensor:
+        """
+        mel: (B, n_mels, T, 1)
+        pos_emb: (B, n_state, T, 1)
+        return: (B, vocab_size, T_out, 1)
+        """
+        x = self.encoder(mel, pos_emb)         # (B, n_state, T', 1)
+        logits = self.ctc_linear(x)            # (B, vocab_size, T', 1)
         return logits
