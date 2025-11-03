@@ -6,7 +6,7 @@
 | **Positional Encoding**     | Addition simple (x + pos)                             | ✅ Oui (`Add`)                             |                                                              |
 | **LayerNorm**               | $(x - \mu)/\sqrt{\sigma^2+\epsilon}\cdot\gamma+\beta$ | ❌ Non supporté                            | On CPU                                                       |
 | **Attention (Q,K,V)**       | $Q = XW_Q + b_Q$, K,V idem (Linear)                   | ✅ Oui (`MatMul`, `Add`)                   |                                                              |
-|                             | Score (S = QK^T / \sqrt{d_k})                         | ❌  `MatMul` OK, division OK, mais Softmax | $\text{softmax}(QK^T)V \approx \phi(Q)(\phi(K)^TV)$où $\phi(x) = \text{SiLU}(x) + 1$ |
+|                             | Score (S = QK^T / \sqrt{d_k})                         | ❌  `MatMul` OK, division OK, mais Softmax | $\text{Softmax}(QK^T)V\approx\Phi(Q)\bigl(\Phi(K)^T V\bigr)$où $\phi(x) = \text{SiLU}(x) + 1$ |
 |                             | Softmax normalization                                 | Non supporté                              |                                                              |
 |                             | Weighted sum (S_{norm}V)                              | `MatMul` OK, mais dépend du Softmax       |                                                              |
 | **Feed-Forward (MLP)**      | Linear → GELU → Linear                                | ❌ GELU “preview”                          | SiLU                                                         |
