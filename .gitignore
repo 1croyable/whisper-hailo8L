@@ -1,0 +1,5 @@
+model/assets/fr.arpa.bin
+model/student_ctc_kd.pth.epoch*
+model/assets/manifest.tsv
+whisper-hailo8l_hailo_model.har
+whisper-hailo8l.onnx

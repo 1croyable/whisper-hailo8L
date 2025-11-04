@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from model.mel import ensure_mel_4d
-from model.model import AudioEncoder, EncoderCTC
+from model.whisper_hailo_model import AudioEncoder, EncoderCTC
 from model.ctc_decoder import ctc_prefix_beam_search, load_french_tokenizer
 
 def sinusoids(length: int, channels: int, max_timescale: int = 10000):
