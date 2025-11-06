@@ -259,7 +259,7 @@ def main():
             B, _, T, _ = mel.shape
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                 # positional embedding: compute T_out from student's encoder conv2 stride
                 try:
                     stride_time = student.encoder.conv2.stride[0]
