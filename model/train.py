@@ -85,13 +85,26 @@ def collate_fn(batch, tokenizer, n_mels=80, target_frames: int = 3000):
     waveforms = []
 
     for audio_path, transcript in batch:
-        mel_4d = ensure_mel_4d(audio_path, n_mels=n_mels, target_frames=target_frames, normalize=True)
+        # 尝试安全加载 mel，若失败则跳过该样本
+        try:
+            mel_4d = ensure_mel_4d(audio_path, n_mels=n_mels, target_frames=target_frames, normalize=True)
+        except Exception as e:
+            continue
+
         # ensure shape (1, n_mels, T, 1)
-        mels.append(mel_4d.squeeze(0))
+        try:
+            mels.append(mel_4d.squeeze(0))
+        except Exception as e:
+            continue
 
         # encode transcript and filter out timestamp/special tokens >= timestamp_begin
-        toks = tokenizer.encode(transcript)
-        toks = [t for t in toks if t < tokenizer.encoding.n_vocab]
+        try:
+            toks = tokenizer.encode(transcript)
+            toks = [t for t in toks if t < tokenizer.encoding.n_vocab]
+        except Exception as e:
+            mels.pop()
+            continue
+
         target_tensors.extend(toks)
         target_lens.append(len(toks))
 
@@ -111,6 +124,10 @@ def collate_fn(batch, tokenizer, n_mels=80, target_frames: int = 3000):
                 wav = wav[:target_samples]
 
         waveforms.append(wav)
+
+    # 如果本 batch 内没有有效样本，返回 None（训练循环会跳过）
+    if len(mels) == 0:
+        return None
 
     # stack mels into (B, n_mels, T, 1)
     mels = torch.stack([m.unsqueeze(0) for m in mels], dim=0).squeeze(1)
@@ -207,11 +224,18 @@ def main():
     # === 数据集加载 ===
     total_len = len(ds)
     subset_len = int(total_len * sample_fraction)
-    subset_indices = random.sample(range(total_len), subset_len)
+
+    # 只选择 manifest 中磁盘上实际存在的音频路径，尽量满足期望的样本数量
+    available_indices = [i for i, (p, _) in enumerate(ds.samples) if os.path.exists(p)]
+    if len(available_indices) >= subset_len:
+        subset_indices = random.sample(available_indices, subset_len)
+    else:
+        subset_indices = available_indices
+
     train_dataset = torch.utils.data.Subset(ds, subset_indices)
     loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True, collate_fn=collate, num_workers=8, pin_memory=True)
 
-    print(f"[INFO] Using {sample_fraction*100:.0f}% of dataset ({subset_len}/{total_len} samples).")
+    print(f"[INFO] Using {len(subset_indices)}/{total_len} samples ({(len(subset_indices)/total_len)*100:.1f}% of dataset).")
 
     # === 混合精度训练支持 ===
     scaler = torch.amp.GradScaler(enabled=use_amp)
@@ -223,6 +247,12 @@ def main():
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
 
         for batch in pbar:
+            # collate_fn may return None when all samples in this batch were invalid
+            if batch is None:
+                # simply skip this batch
+                pbar.set_postfix({"skipped": "empty_batch"})
+                continue
+
             mel = batch["mel"].to(device)  # (B, n_mels, T, 1)
             targets = batch["targets"].to(device)
             target_lens = batch["target_lens"].to(device)
@@ -244,7 +274,7 @@ def main():
                 s_enc = student.encoder(mel, pos_emb)  # expect (B, n_state, T_out, 1)
                 student_logits = student.ctc_linear(s_enc).squeeze(-1)  # (B, V, T_out)
                 log_probs = F.log_softmax(student_logits.permute(2, 0, 1), dim=-1)
-                input_lengths = torch.full((B,), T_out, dtype=torch.long)
+                input_lengths = torch.full((B,), T_out, dtype=torch.long, device=device)
 
                 # === CTC loss ===
                 if targets.numel() == 0:
@@ -256,10 +286,11 @@ def main():
                 # === Teacher encoder feature distillation (MSE) ===
                 raw_wavs = batch.get("waveforms", None)
                 loss_kd = torch.tensor(0.0, device=device)
-                # attempt KD if we have at least one waveform
+
                 if raw_wavs is not None and any([w is not None for w in raw_wavs]):
+                    valid_wavs = [w for w in raw_wavs if w is not None]
                     with torch.no_grad():
-                        proc_inputs = processor(raw_wavs, sampling_rate=16000, return_tensors="pt", padding=True)
+                        proc_inputs = processor(valid_wavs, sampling_rate=16000, return_tensors="pt", padding=True)
                         input_features = proc_inputs.input_features.to(device)
                         teacher_out = teacher.encoder(input_features=input_features, return_dict=True)
                         t_enc = teacher_out.last_hidden_state  # (B, L_t, teacher_hidden)
@@ -300,7 +331,10 @@ def main():
 
         # 评估模型
         eval_audio_path = "test_audio.mp3"
-        evaluate_once(student, eval_audio_path, tokenizer, device)
+        if os.path.exists(eval_audio_path):
+            evaluate_once(student, eval_audio_path, tokenizer, device)
+        else:
+            print("[WARN] eval audio not found, skip evaluation.")
 
     torch.save(student.state_dict(), args.save)
     print(f"[INFO] Training complete. Saved model to {args.save}")
