@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
@@ -9,13 +10,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
+from model.ctc_decoder import ctc_prefix_beam_search
 from model import ensure_mel_4d, load_audio
 from model import AudioEncoder, EncoderCTC
 from model import load_french_tokenizer
 from model.mel import HOP_LENGTH
 
-DATASET_RATIO = 0.1
+def evaluate_once(model, audio_path, tokenizer, device):
+    model.eval()
+    mel_4d = ensure_mel_4d(audio_path, n_mels=80, target_frames=3000, normalize=True).to(device)
+    B, C, T, _ = mel_4d.shape
+    T_out = T // model.encoder.conv2.stride[0]
+    pos = sinusoids(T_out, 512).T.unsqueeze(0).unsqueeze(-1).to(torch.float32).to(device)
+    
+    with torch.no_grad():
+        s_enc = model.encoder(mel_4d, pos)
+        logits = model.ctc_linear(s_enc).squeeze(-1)
+    
+    results = ctc_prefix_beam_search(
+        logits, beam_size=8, alpha=0.6, beta=-0.3,
+        blank_id=tokenizer.encoding.n_vocab, tokenizer=tokenizer
+    )
+    print("\n=== Decoded Text ===")
+    for i, r in enumerate(results):
+        print(f"[{i}] {r}")
+    model.train()
 
 def sinusoids(length: int, channels: int, max_timescale: int = 10000):
     assert channels % 2 == 0
@@ -167,90 +188,119 @@ def main():
     # add projector params to optimizer so projector gets updated
     optimizer.add_param_group({'params': projector.parameters()})
 
-    # === 5. Training ===
-    student.train()
-    print("[INFO] Starting KD training...")
-    for epoch in range(args.epochs):
-        # sample a subset of the dataset each epoch to save compute
-        n_total = len(ds)
-        n_samples = max(1, int(n_total * DATASET_RATIO))
-        indices = np.random.choice(n_total, n_samples, replace=False)
-        subset = torch.utils.data.Subset(ds, indices)
-        loader = DataLoader(subset, batch_size=args.batch, shuffle=True, collate_fn=collate)
+    # === 修改点 ===
+    # 可自定义的路径
+    resume_ckpt = os.path.join(os.path.dirname(args.save), "student_ctc_kd.pth.epoch4")
 
+    # 训练超参数
+    sample_fraction = 0.2  # 使用 20% 数据集
+    use_amp = True  # 混合精度
+
+    # === 加载 checkpoint ===
+    if os.path.exists(resume_ckpt):
+        print(f"[INFO] Loading checkpoint: {resume_ckpt}")
+        sd = torch.load(resume_ckpt, map_location=device)
+        student.load_state_dict(sd, strict=False)
+    else:
+        print("[INFO] No checkpoint found, training from scratch.")
+
+    # === 数据集加载 ===
+    total_len = len(ds)
+    subset_len = int(total_len * sample_fraction)
+    subset_indices = random.sample(range(total_len), subset_len)
+    train_dataset = torch.utils.data.Subset(ds, subset_indices)
+    loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True, collate_fn=collate, num_workers=8, pin_memory=True)
+
+    print(f"[INFO] Using {sample_fraction*100:.0f}% of dataset ({subset_len}/{total_len} samples).")
+
+    # === 混合精度训练支持 ===
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    # === 训练循环 ===
+    for epoch in range(5, args.epochs):  # 从第5轮继续
+        student.train()
+        running_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
+
         for batch in pbar:
             mel = batch["mel"].to(device)  # (B, n_mels, T, 1)
             targets = batch["targets"].to(device)
             target_lens = batch["target_lens"].to(device)
             B, _, T, _ = mel.shape
 
-            # positional embedding: compute T_out from student's encoder conv2 stride
-            try:
-                stride_time = student.encoder.conv2.stride[0]
-                T_out = T // stride_time
-            except Exception:
-                T_out = T // 2
-            pos = sinusoids(T_out, 512)
-            pos_emb = pos.T.unsqueeze(0).unsqueeze(-1).to(torch.float32).to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(enabled=use_amp):
+                # positional embedding: compute T_out from student's encoder conv2 stride
+                try:
+                    stride_time = student.encoder.conv2.stride[0]
+                    T_out = T // stride_time
+                except Exception:
+                    T_out = T // 2
+                pos = sinusoids(T_out, 512)
+                pos_emb = pos.T.unsqueeze(0).unsqueeze(-1).to(torch.float32).to(device)
 
-            # === Student forward ===
-            # get encoder features from student, then apply ctc linear to get logits
-            s_enc = student.encoder(mel, pos_emb)  # expect (B, n_state, T_out, 1)
-            student_logits = student.ctc_linear(s_enc).squeeze(-1)  # (B, V, T_out)
-            log_probs = F.log_softmax(student_logits.permute(2, 0, 1), dim=-1)
-            input_lengths = torch.full((B,), T_out, dtype=torch.long)
+                # === Student forward ===
+                # get encoder features from student, then apply ctc linear to get logits
+                s_enc = student.encoder(mel, pos_emb)  # expect (B, n_state, T_out, 1)
+                student_logits = student.ctc_linear(s_enc).squeeze(-1)  # (B, V, T_out)
+                log_probs = F.log_softmax(student_logits.permute(2, 0, 1), dim=-1)
+                input_lengths = torch.full((B,), T_out, dtype=torch.long)
 
-            # === CTC loss ===
-            if targets.numel() == 0:
-                # no labeled targets in this batch -> zero CTC loss
-                loss_ctc = torch.tensor(0.0, device=device)
-            else:
-                loss_ctc = ctc_loss_fn(log_probs, targets, input_lengths, target_lens)
+                # === CTC loss ===
+                if targets.numel() == 0:
+                    # no labeled targets in this batch -> zero CTC loss
+                    loss_ctc = torch.tensor(0.0, device=device)
+                else:
+                    loss_ctc = ctc_loss_fn(log_probs, targets, input_lengths, target_lens)
 
-            # === Teacher encoder feature distillation (MSE) ===
-            raw_wavs = batch.get("waveforms", None)
-            loss_kd = torch.tensor(0.0, device=device)
-            # attempt KD if we have at least one waveform
-            if raw_wavs is not None and any([w is not None for w in raw_wavs]):
-                with torch.no_grad():
-                    proc_inputs = processor(raw_wavs, sampling_rate=16000, return_tensors="pt", padding=True)
-                    input_features = proc_inputs.input_features.to(device)
-                    teacher_out = teacher.encoder(input_features=input_features, return_dict=True)
-                    t_enc = teacher_out.last_hidden_state  # (B, L_t, teacher_hidden)
+                # === Teacher encoder feature distillation (MSE) ===
+                raw_wavs = batch.get("waveforms", None)
+                loss_kd = torch.tensor(0.0, device=device)
+                # attempt KD if we have at least one waveform
+                if raw_wavs is not None and any([w is not None for w in raw_wavs]):
+                    with torch.no_grad():
+                        proc_inputs = processor(raw_wavs, sampling_rate=16000, return_tensors="pt", padding=True)
+                        input_features = proc_inputs.input_features.to(device)
+                        teacher_out = teacher.encoder(input_features=input_features, return_dict=True)
+                        t_enc = teacher_out.last_hidden_state  # (B, L_t, teacher_hidden)
 
-                # interpolate teacher encoder time axis to student T_out
-                t_enc = t_enc.permute(0, 2, 1)  # (B, teacher_hidden, L_t)
-                if t_enc.shape[-1] != T_out:
-                    t_enc = F.interpolate(t_enc, size=T_out, mode="linear", align_corners=False)
-                t_enc = t_enc.permute(0, 2, 1)  # (B, T_out, teacher_hidden)
+                    # interpolate teacher encoder time axis to student T_out
+                    t_enc = t_enc.permute(0, 2, 1)  # (B, teacher_hidden, L_t)
+                    if t_enc.shape[-1] != T_out:
+                        t_enc = F.interpolate(t_enc, size=T_out, mode="linear", align_corners=False)
+                    t_enc = t_enc.permute(0, 2, 1)  # (B, T_out, teacher_hidden)
 
-                # project teacher features to student dim and compute MSE with student encoder outputs
-                t_proj = projector(t_enc)  # (B, T_out, n_state)
-                # normalize student encoder features to (B, T_out, n_state)
-                if s_enc is not None:
-                    if s_enc.dim() == 4:
-                        s_feats = s_enc.squeeze(-1).permute(0, 2, 1)  # (B, T_out, n_state)
-                    else:
-                        s_feats = s_enc.permute(0, 2, 1)
-                    loss_kd = kd_loss_fn(s_feats, t_proj)
+                    # project teacher features to student dim and compute MSE with student encoder outputs
+                    t_proj = projector(t_enc)  # (B, T_out, n_state)
+                    # normalize student encoder features to (B, T_out, n_state)
+                    if s_enc is not None:
+                        if s_enc.dim() == 4:
+                            s_feats = s_enc.squeeze(-1).permute(0, 2, 1)  # (B, T_out, n_state)
+                        else:
+                            s_feats = s_enc.permute(0, 2, 1)
+                        loss_kd = kd_loss_fn(s_feats, t_proj)
 
-            # === Total loss ===
-            loss = (1.0 - lambda_kd) * loss_ctc + lambda_kd * loss_kd
+                # === Total loss ===
+                loss = (1.0 - lambda_kd) * loss_ctc + lambda_kd * loss_kd
 
-            # === Backprop ===
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 2.0)
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
+            running_loss += loss.item()
             pbar.set_postfix({
                 "total": f"{loss.item():.4f}",
                 "ctc": f"{loss_ctc.item():.4f}",
                 "kd": f"{loss_kd:.4f}" if isinstance(loss_kd, float) else f"{loss_kd.item():.4f}"
             })
 
-        torch.save(student.state_dict(), f"{args.save}.epoch{epoch}")
+        save_path = f"{args.save}.epoch{epoch}"
+        torch.save(student.state_dict(), save_path)
+        print(f"[INFO] Saved checkpoint: {save_path}")
+
+        # 评估模型
+        eval_audio_path = "test_audio.mp3"
+        evaluate_once(student, eval_audio_path, tokenizer, device)
 
     torch.save(student.state_dict(), args.save)
     print(f"[INFO] Training complete. Saved model to {args.save}")

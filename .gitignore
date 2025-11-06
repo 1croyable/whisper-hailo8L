@@ -1,5 +1,20 @@
+# 模型与权重文件
+*.pth
+*.onnx
+*.har
+*.bin
+*.tsv
+
+# 特定大文件路径
 model/assets/fr.arpa.bin
-model/student_ctc_kd.pth.epoch*
 model/assets/manifest.tsv
-whisper-hailo8l_hailo_model.har
-whisper-hailo8l.onnx
+model/student_ctc_kd.pth.epoch*
+model/*.pth
+
+# 缓存和中间结果
+__pycache__/
+*.log
+*.tmp
+*.out
+*.npy
+*.npz

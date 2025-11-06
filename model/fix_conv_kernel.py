@@ -3,8 +3,8 @@ from onnx import helper
 from onnx import numpy_helper
 
 def main():
-    src = 'whisper-hailo8l.onnx'
-    dst = 'whisper-hailo8l.onnx'
+    src = 'whisper-hailo8l-trained0.onnx'
+    dst = 'whisper-hailo8l-trained0.onnx'
     print(f'Loading {src} (with external data if present)...')
     m = onnx.load(src, load_external_data=True)
 

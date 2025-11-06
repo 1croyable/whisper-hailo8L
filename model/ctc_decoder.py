@@ -48,7 +48,7 @@ def ctc_prefix_beam_search(
     tokenizer=None, # 用于解码，ID映射到文本
 ) -> List[str]: # 返回: List[str]: 每个 batch 对应的解码文本
     # 语言模型加载
-    lm = KenLMAdapter("/model/assets/fr.arpa.bin", tokenizer=tokenizer)
+    lm = KenLMAdapter("model/assets/fr.arpa.bin", tokenizer=tokenizer)
 
     # 保证维度正确
     if logits.dim() == 4 and logits.shape[-1] == 1:
