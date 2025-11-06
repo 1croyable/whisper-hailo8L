@@ -244,7 +244,7 @@ def main():
     for epoch in range(5, args.epochs):  # 从第5轮继续
         student.train()
         running_loss = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", mininterval=20)
 
         for batch in pbar:
             # collate_fn may return None when all samples in this batch were invalid
