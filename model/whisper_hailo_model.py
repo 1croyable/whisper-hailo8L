@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+import math
 
 class Linear(nn.Module):
     """
@@ -66,9 +67,8 @@ class LayerNorm(nn.Module):
 class MultiHeadAttention(nn.Module):
     """
     4D版本多头注意力，保持 (B, C, T, 1)
-    - 使用 φ(x)=silu(x)+1 代替 softmax
-    - 不含 permute、transpose、view
-    - 全部运算为 conv + mul + sum，可被 Hailo 编译
+    - 线性注意力/核注意力写法
+    - 全程 4D，不用 permute
     """
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
@@ -76,21 +76,16 @@ class MultiHeadAttention(nn.Module):
         self.n_state = n_state
         self.d_head = n_state // n_head
 
-        # 用 1×1 Conv 表示线性映射
         self.query = Linear(n_state, n_state)
         self.key   = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out   = Linear(n_state, n_state)
 
-    # φ(x)：softmax 近似
     def phi(self, x: Tensor) -> Tensor:
+        # 正值核，防止全 0
         return F.silu(x) + 1.0
 
     def forward(self, x: Tensor) -> Tensor:
-        """
-        x: (B, C, T, 1)
-        return: (B, C, T, 1)
-        """
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
 
@@ -98,40 +93,39 @@ class MultiHeadAttention(nn.Module):
         k = self.key(x)     # (B, C, T, 1)
         v = self.value(x)   # (B, C, T, 1)
 
-        # 注意力主体
         out = self.qkv_attention(q, k, v)
         return self.out(out)
 
     def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        """
-        线性注意力 (kernel attention)
-        """
         B, C, T, _ = q.shape
         H = self.n_head
         Dh = self.d_head
 
-        # 对 q,k 应用核函数
+        # 核函数
         phi_q = self.phi(q)
         phi_k = self.phi(k)
 
-        # 分头 reshape
+        # 分头
         phi_q = phi_q.reshape(B, H, Dh, T, 1)
         phi_k = phi_k.reshape(B, H, Dh, T, 1)
-        v = v.reshape(B, H, Dh, T, 1)
+        v     = v.reshape(B, H, Dh, T, 1)
 
-        # 分子：Σ_t φ(k_t) * v_t
-        num = torch.sum(phi_k * v, dim=3, keepdim=True) # (B,H,Dh,1,1)
+        # 因为你想要“时间因果”，这里用 cumsum
+        k_sum  = torch.cumsum(phi_k, dim=3)        # (B,H,Dh,T,1)  累积的 φ(k)
+        kv_sum = torch.cumsum(phi_k * v, dim=3)    # (B,H,Dh,T,1)  累积的 φ(k)*v
 
-        # 分母：Σ_t φ(k_t)
-        den = torch.sum(phi_k, dim=3, keepdim=True) # (B,H,Dh,1,1)
+        # 分母：按 q 加权的累积 key，总是标量 (对 Dh 求和)
+        den = torch.sum(phi_q * k_sum, dim=2, keepdim=True)  # (B,H,1,T,1)
         den = den + 1e-6
 
-        norm = phi_q * den
-        out = (phi_q * num) / norm # (B,H,Dh,T,1)
+        # 分子：不要对 Dh 求和，逐通道乘上 q，再除以分母
+        out = (phi_q * kv_sum) / den               # (B,H,Dh,T,1)
 
-        # 合并 heads → (B,C,T,1)
-        return out.reshape(B, C, T, 1)
-    
+        # 合并 heads
+        out = out.reshape(B, C, T, 1)
+        out = out / math.sqrt(self.d_head)
+        return out
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
@@ -154,20 +148,14 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 class AudioEncoder(nn.Module):
-    def __init__(
-        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
-    ):
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
         super().__init__()
-
-        # 第一层卷积：提升通道数 n_mels → n_state
         self.conv1 = nn.Conv2d(
             in_channels=n_mels,
             out_channels=n_state,
             kernel_size=(3, 1),
             padding=(1, 0)
         )
-
-        # 第二层卷积：时间降采样
         self.conv2 = nn.Conv2d(
             in_channels=n_state,
             out_channels=n_state,
@@ -175,33 +163,22 @@ class AudioEncoder(nn.Module):
             stride=(2, 1),
             padding=(1, 0)
         )
-
-        # 残差注意力块
-        self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
+        self.blocks = nn.ModuleList(
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
-
-        # 归一化层仿照LayerNorm
         self.ln_post = LayerNorm(n_state)
 
     def forward(self, x: Tensor, pos_emb: Optional[Tensor] = None) -> Tensor:
-        """
-        x : (B, n_mels, T, 1)
-        pos_emb : (B, n_state, T, 1)
-        return : (B, n_state, T_out, 1)
-        """
-        # 两层卷积特征提取
         x = F.silu(self.conv1(x))
         x = F.silu(self.conv2(x))  # (B, n_state, T/2, 1)
 
-        # 叠加位置编码
-        x = (x + pos_emb[..., :x.shape[2], :]).to(x.dtype)
+        if pos_emb is not None:
+            # 截到同样的时间长度
+            x = (x + pos_emb[..., :x.shape[2], :]).to(x.dtype)
 
-        # 注意力块
         for block in self.blocks:
-            x = block(x)  # (B, n_state, T', 1)
+            x = block(x)
 
-        # 最后归一化
         return self.ln_post(x)
 
 

@@ -18,3 +18,5 @@ __pycache__/
 *.out
 *.npy
 *.npz
+
+train-result/student_ctc_kd.pth.epoch*
