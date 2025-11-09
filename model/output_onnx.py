@@ -1,43 +1,44 @@
 import torch
-from model import AudioEncoder, EncoderCTC
+from model.whisper_hailo_model import WhisperHailoModel, ModelDimensions
 
-
-# === 模型超参数（要与训练时一致）===
-n_mels = 80
-n_state = 512
-n_head = 8
-n_layer = 12
-n_ctx = 3000
-vocab_size = 51865 + 1  # vocab + blank
-
+dem = ModelDimensions()
+dem.n_mels=80
+dem.n_audio_ctx=3000
+dem.n_audio_state=512
+dem.n_audio_head=8
+dem.n_audio_layer=12
+dem.n_vocab=51865
+dem.n_text_ctx=448
+dem.n_text_state=512
+dem.n_text_head=8
+dem.n_text_layer=12
 
 # === 1. 构建模型结构 ===
-audio_encoder = AudioEncoder(n_mels, n_ctx, n_state, n_head, n_layer)
-model = EncoderCTC(audio_encoder, vocab_size, n_state)
+model = WhisperHailoModel(dem)
 model.eval()
 
+# === 2. 加载初始权重（可选）===
+# 如果有预训练权重，可以加载
+# weights_path = "model/student_ctc_kd.pth.epoch0"
+# sd = torch.load(weights_path, map_location="cpu")
+# model.load_state_dict(sd, strict=False)
+# print(f"[INFO] Loaded weights from {weights_path}")
 
-# === 2. 加载训练好的权重 ===
-weights_path = "model/student_ctc_kd.pth.epoch0"
-sd = torch.load(weights_path, map_location="cpu")
-model.load_state_dict(sd, strict=False)
-print(f"[INFO] Loaded weights from {weights_path}")
-
-
-# === 3. 创建一个示例输入 ===
-dummy_mel = torch.randn(1, n_mels, n_ctx, 1, dtype=torch.float32)
-pos_emb = torch.randn(1, n_state, n_ctx // 2, 1, dtype=torch.float32)  # 模拟位置编码
-
+# === 3. 创建示例输入 ===
+dummy_mel = torch.randn(1, dem.n_mels, dem.n_audio_ctx, 1, dtype=torch.float32)
+dummy_tokens = torch.randint(0, dem.n_vocab, (1, dem.n_text_ctx), dtype=torch.long)
 
 # === 4. 导出为 ONNX ===
-onnx_path = "whisper-hailo8l-trained0.onnx"
+onnx_path = "whisper-hailo8l-initial.onnx"
 torch.onnx.export(
     model,
-    (dummy_mel, pos_emb),
+    (dummy_mel, dummy_tokens),
     onnx_path,
-    input_names=["mel", "pos_emb"],
+    input_names=["mel", "tokens"],
     output_names=["logits"],
-    opset_version=13,
     dynamic_axes=None,
+    do_constant_folding=True,
+    keep_initializers_as_inputs=False,
+    opset_version=12
 )
 print(f"[SUCCESS] Exported to {onnx_path}")
