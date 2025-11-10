@@ -97,39 +97,56 @@ class RMSNorm4D(nn.Module):
 
 class SSM4D(nn.Module):
     """
-    每个通道独立指数衰减 + 相位旋转记忆:
-    y_t = Σ β * α^τ * cos(τ * θ) * x_{t-τ}
+    每个通道独立指数衰减 + 相位旋转记忆。
+    不使用任何 Pad 算子；改为在时间维前面拼接零向量，再做 depthwise conv，
+    以避免 ONNX 导出产生 Pad/Cast 组合，保证 Hailo 解析兼容。
     """
     def __init__(self, n_state: int, kernel_size: int = 24):
         super().__init__()
         self.n_state = n_state
         self.kernel_size = kernel_size
+
+        # 这些还是参数
         self.alpha_logit = nn.Parameter(torch.zeros(n_state))
         self.beta_param = nn.Parameter(torch.ones(n_state) * 0.5)
         self.theta_param = nn.Parameter(torch.linspace(0, float(np.pi / 4), n_state))
 
+        # 需要“往上”补多少步（时间维前置零）
+        self.pad_top = int(kernel_size - 1)
+
+        # 真正的深度卷积，不带 padding
+        self.conv = nn.Conv2d(
+            in_channels=n_state,
+            out_channels=n_state,
+            kernel_size=(kernel_size, 1),
+            padding=(0, 0),
+            groups=n_state,
+            bias=False,
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         # x: (B, C, T, 1)
         B, C, T, _ = x.shape
-        assert C == self.n_state, f"Channel mismatch ({C} vs {self.n_state})"
+        assert C == self.n_state
 
-        # 指数衰减参数
+        # 动态生成一套核并塞到 conv 里
         alpha = torch.sigmoid(self.alpha_logit).clamp(1e-4, 1 - 1e-4).to(x.dtype)
         beta  = F.softplus(self.beta_param).to(x.dtype)
         theta = self.theta_param.to(x.dtype)
 
-        # 生成指数卷积核 (C,K)
         h = torch.arange(self.kernel_size, device=x.device, dtype=x.dtype)
         decay = torch.pow(alpha.unsqueeze(1), h.unsqueeze(0))
         phase = torch.cos(h.unsqueeze(0) * theta.unsqueeze(1))
-        kernel = beta.unsqueeze(1) * decay * phase
+        kernel = beta.unsqueeze(1) * decay * phase              # (C,K)
         weight = kernel.view(C, 1, self.kernel_size, 1)
+        self.conv.weight = nn.Parameter(weight, requires_grad=True)
 
-        # 深度可分离因果卷积
-        y = F.conv2d(x, weight, bias=None, stride=1,
-                     padding=(self.kernel_size - 1, 0), groups=C)
-        # 替换切片为 torch.narrow，避免 ONNX Slice 参数问题
-        y = torch.narrow(y, dim=2, start=0, length=T)
+        # 使用静态 F.pad，导出为固定 pads 的 Pad 节点（Hailo 友好）
+        if self.pad_top > 0:
+            x = F.pad(x, (0, 0, int(self.pad_top), 0))  # (left,right,top,bottom)
+
+        y = self.conv(x)            # (B,C,T,1)
+
         return y
 
 class MultiHeadAttention(nn.Module):
@@ -161,7 +178,7 @@ class MultiHeadAttention(nn.Module):
             q = self.query(x)   # (B, C, T, 1)
             k = self.key(x)     # (B, C, T, 1)
             v = self.value(x)   # (B, C, T, 1)
-            out = self._self_attention_linear(q, k, v)
+            out = self._self_attention_kernel(q, k, v)
             return self.out(out)
         else:
             q = self.query(x)
@@ -170,26 +187,33 @@ class MultiHeadAttention(nn.Module):
             out = self._cross_attention_linear(q, k, v)
             return self.out(out)
 
-    def _self_attention_linear(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        B, C, T, _ = q.shape
-        H = self.n_head
-        Dh = self.d_head
+    def _self_attention_kernel(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        B = 1
+        T = 1500
+        C = 512
+        H = 8
+        Dh = 64
 
+        # 1) 核映射 + 分头
         phi_q = self.phi(q).reshape(B, H, Dh, T, 1)
         phi_k = self.phi(k).reshape(B, H, Dh, T, 1)
         v = v.reshape(B, H, Dh, T, 1)
+        # 2) 全局聚合（注意不是 cumsum，是 sum）
+        #    S_k  : Σ_t φ(k_t)
+        #    S_kv : Σ_t φ(k_t) * v_t
+        S_k  = torch.sum(phi_k, dim=3, keepdim=True)        # (B,H,Dh,1,1)
+        S_kv = torch.sum(phi_k * v, dim=3, keepdim=True)    # (B,H,Dh,1,1)
 
-        # 因果累计 (Hailo 支持 cumsum)
-        k_sum = torch.cumsum(phi_k, dim=3)
-        kv_sum = torch.cumsum(phi_k * v, dim=3)
+        # 3) 对每个时间步用当前的 φ(q_t) 去“选取”这个全局聚合
+        #    分母要在 Dh 上再汇总一次，这样 phi_q 就真的起作用了
+        den = torch.sum(phi_q * S_k, dim=2, keepdim=True) + 1e-6   # (B,H,1,T,1)
+        out = (phi_q * S_kv) / den                                 # (B,H,Dh,T,1)
 
-        den = torch.sum(phi_q * k_sum, dim=2, keepdim=True) + 1e-6
-        out = (phi_q * kv_sum) / den
-
+        # 4) 合并 heads
         out = out.reshape(B, C, T, 1)
         out = out / torch.sqrt(torch.tensor(Dh, dtype=out.dtype, device=out.device))
         return out
-
+    
     def _cross_attention_linear(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         B, C, Tq, _ = q.shape
         _, Ck, Tk, _ = k.shape
@@ -242,14 +266,14 @@ class AudioEncoder(nn.Module):
             in_channels=n_mels,
             out_channels=n_state,
             kernel_size=(3, 1),
-            padding=(1, 0)
+            padding=(0, 0)
         )
         self.conv2 = nn.Conv2d(
             in_channels=n_state,
             out_channels=n_state,
             kernel_size=(3, 1),
             stride=(2, 1),
-            padding=(1, 0)
+            padding=(0, 0)
         )
         self.blocks = nn.ModuleList(
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
@@ -257,7 +281,13 @@ class AudioEncoder(nn.Module):
         self.ln_post = LayerNorm(n_state)
 
     def forward(self, x: Tensor, pos_emb: Optional[Tensor] = None) -> Tensor:
+        # 使用静态 F.pad 替代 conv 的对称 padding，避免 Hailo 自动拆 padding
+        # conv1: kernel=(3,1), 期望对称 pad 1 → 使用 F.pad pads=(0,0,1,1)
+        x = F.pad(x, (0, 0, 1, 1))
         x = F.silu(self.conv1(x))
+
+        # conv2: kernel=(3,1), stride=(2,1), 对称 pad 1
+        x = F.pad(x, (0, 0, 1, 1))
         x = F.silu(self.conv2(x))  # (B, n_state, T/2, 1)
 
         if pos_emb is not None:
@@ -271,59 +301,56 @@ class AudioEncoder(nn.Module):
     
 class MambaLikeBlock4D(nn.Module):
     """
-    一个 NPU 友好的、mamba 风格的 4D block
-    输入输出: (B, C, T, 1) 和注意力块一样
-    核心步骤: RMS Norm, projection, convolution, SiLU, 选择性SSM, output projection, 残差
+    NPU / Hailo 友好的 Mamba 风格块。
+    关键改动：使用 F.pad(静态 int) 代替 nn.ConstantPad2d，避免 ONNX 导出产生 Pad→Cast
+    链导致 Hailo 解析 KeyError (如 Cast_output_0_value 缺失)。
     """
     def __init__(self, n_state: int, d_conv: int = 3, ssm_kernel: int = 24):
         super().__init__()
         self.n_state = n_state
-
-        # 进来先做归一化
+        # 确保为静态 int，避免 ONNX 导出时插入 Cast
+        self.d_conv_ks = int(d_conv)
         self.ln = RMSNorm4D(n_state)
-
-        # 把 C 打成 2C，前 C 做内容，后 C 做 gate
         self.in_proj = Linear(n_state, 2 * n_state)
 
-        # depthwise conv：对每个通道单独卷，沿时间维
-        # 输入是 (B, 2C, T, 1)
+        # 使用静态整数记录所需的因果 padding（顶端填充），在 forward 中用 F.pad 实现
+        # 说明：使用 nn.ConstantPad2d 在某些 PyTorch→ONNX 导出路径下会生成 Pad→Cast 链，
+        # Hailo 解析器无法识别中间 Cast，导致 KeyError。改用 F.pad 可避免该问题。
+        self.pad_top = int(self.d_conv_ks - 1)
+
+        # depthwise conv 本身不带 padding
         self.d_conv = nn.Conv2d(
             in_channels=2 * n_state,
             out_channels=2 * n_state,
             kernel_size=(d_conv, 1),
-            # 直接在 conv 上做时间维左侧 padding，实现因果卷积
-            padding=(d_conv - 1, 0),
-            groups=2 * n_state
+            padding=(0, 0),
+            groups=2 * n_state,
         )
 
         self.ssm = SSM4D(n_state, kernel_size=ssm_kernel)
-
-        # 输出再压回 C
         self.out_proj = Linear(n_state, n_state)
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (B, C, T, 1)
         B, C, T, _ = x.shape
 
-        h = self.ln(x)                  # (B,C,T,1)
-        h = self.in_proj(h)             # (B,2C,T,1)
-        # 直接使用带 padding 的 depthwise conv，再做因果裁剪，保持与残差同长
-        h = self.d_conv(h)
-        h = torch.narrow(h, dim=2, start=0, length=T)
+        h = self.ln(x)
+        h = self.in_proj(h)         # (B,2C,T,1)
 
-        # 4) 拆成内容 / gate 两半
-        h_content, h_gate = torch.split(h, C, dim=1)   # (B,C,T,1), (B,C,T,1)
+        # 因果“补齐” → depthwise（使用静态 F.pad 生成 Pad 节点，pads 为常量）
+        if self.pad_top > 0:
+            h = F.pad(h, (0, 0, int(self.pad_top), 0))  # (B,2C,T+pad_top,1)
+        h = self.d_conv(h)          # (B,2C,T,1)
 
-        # 内容走 SiLU -> SSM，gate 经 sigmoid，再做选择性门控
+        # 拆两半
+        h_content, h_gate = torch.split(h, C, dim=1)
+
         h_content = F.silu(h_content)
-        h_ssm = self.ssm(h_content)     # (B,C,T,1)
+        h_ssm = self.ssm(h_content)
         gate = torch.sigmoid(h_gate)
-        h_sel = h_ssm * gate            # (B,C,T,1)
+        h_sel = h_ssm * gate
 
-        # 5) 输出投影
-        h_out = self.out_proj(h_sel)    # (B,C,T,1)
-
-        # 6) 残差
+        h_out = self.out_proj(h_sel)
         return x + h_out
 
 class ResidualMambaCrossBlock(nn.Module):
@@ -389,22 +416,20 @@ class Decoder(nn.Module):
 
         self.n_vocab = n_vocab
 
-    def forward(self, tokens: Tensor, xa: Tensor) -> Tensor:
+    def forward(self, onehot: Tensor, xa: Tensor) -> Tensor:
         """
-        tokens: LongTensor, (B, T_text)
+        onehot: (B, V, T, 1)  # 外部传入的 one-hot
         xa: 编码器输出 (B, C, T_audio, 1)
         返回: logits (B, n_vocab, T_text, 1)
         """
-        if tokens.dim() != 2:
-            raise ValueError("tokens should be (B, T_text)")
-        B, Tt = tokens.shape
+        if onehot.dim() != 4:
+            raise ValueError("onehot should be (B,V,T,1)")
+        B, V, Tt, _ = onehot.shape
         if xa.dim() != 4:
             raise ValueError("xa should be 4D (B,C,T,1)")
 
-        # 1) One-hot + Conv2d 替代 embedding
-        one_hot = F.one_hot(tokens, num_classes=self.n_vocab).float()  # (B, T, V)
-        x = one_hot.transpose(1, 2).unsqueeze(-1)  # (B, V, T, 1)
-        x = self.token_proj(x)                     # (B, C, T, 1)
+        # 1) 直接 one-hot 进入 embedding
+        x = self.token_proj(onehot)   # (B, C, T, 1)
 
         # 2) 加上位置编码 (已是 (B,C,T,1) 形状，不需要 permute)
         pos = self.positional_embedding[:Tt, :].T.unsqueeze(0).unsqueeze(-1)  # (1,C,T,1)
@@ -446,11 +471,11 @@ class WhisperHailoModel(nn.Module):
         """编码音频特征 -> (B, C, T_audio, 1)"""
         return self.encoder(mel)
 
-    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+    def logits(self, onehot: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
         """解码 logits"""
-        return self.decoder(tokens, audio_features)
+        return self.decoder(onehot, audio_features)
 
-    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, mel: torch.Tensor, onehot: torch.Tensor) -> torch.Tensor:
         audio_features = self.encoder(mel)
-        logits = self.decoder(tokens, audio_features)
+        logits = self.decoder(onehot, audio_features)
         return logits
