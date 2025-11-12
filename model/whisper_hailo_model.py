@@ -1,5 +1,6 @@
 import base64
 import gzip
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
@@ -74,6 +75,35 @@ class LayerNorm(nn.Module):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
         return self.norm(x)
+
+class LayerNorm4D(nn.Module):
+    """
+    Hailo-friendly LN for (B, C, T, 1)
+    - 不用 GroupNorm
+    - 不用 **2 / Pow
+    - 只在通道维 C 上做归一化
+    """
+    def __init__(self, n_state: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, n_state, 1, 1))
+        self.bias   = nn.Parameter(torch.zeros(1, n_state, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T, 1)
+        # 1) 按通道求均值
+        mean = x.mean(dim=1, keepdim=True)                # (B,1,T,1)
+
+        # 2) 方差用乘法，不用 **2
+        diff = x - mean                                   # (B,C,T,1)
+        diff_sq = diff * diff                             # (B,C,T,1)
+        var = diff_sq.mean(dim=1, keepdim=True)           # (B,1,T,1)
+
+        # 3) 标准化
+        x_hat = (x - mean) / torch.sqrt(var + self.eps)   # (B,C,T,1)
+
+        # 4) 仿射
+        return x_hat * self.weight + self.bias
     
 class RMSNorm4D(nn.Module):
     """
@@ -82,72 +112,60 @@ class RMSNorm4D(nn.Module):
     """
     def __init__(self, n_state: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
-        # 可学习缩放参数，按通道
-        # 修正权重形状为标准 4D 广播形式
-        self.weight = nn.Parameter(torch.ones(1, n_state, 1, 1))
+        # GroupNorm(1, C) normalizes over all channels
+        self.norm = nn.GroupNorm(1, n_state, eps=eps, affine=True)
 
-    def forward(self, x: Tensor) -> Tensor:
-        if x.dim() != 4:
-            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
-        # 按通道维做均方根归一化
-        rms = (x.pow(2).mean(dim=1, keepdim=True) + self.eps).rsqrt()
-        y = x * rms * self.weight
-        return y
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+    
 class SSM4D(nn.Module):
     """
-    每个通道独立指数衰减 + 相位旋转记忆。
-    不使用任何 Pad 算子；改为在时间维前面拼接零向量，再做 depthwise conv，
-    以避免 ONNX 导出产生 Pad/Cast 组合，保证 Hailo 解析兼容。
+    Hailo-friendly 版本 SSM：
+    - 动态 kernel（alpha, beta, theta）照算；
+    - 不用 F.conv2d；
+    - 全静态 shape：kernel_size=24, pad_top=23；
+    - 输入输出恒定为 4D (B, C, T, 1)。
     """
     def __init__(self, n_state: int, kernel_size: int = 24):
         super().__init__()
         self.n_state = n_state
-        self.kernel_size = kernel_size
+        self.kernel_size = int(kernel_size)
+        time_indices = torch.arange(self.kernel_size).view(1, 1, self.kernel_size)
+        self.register_buffer("time_indices", time_indices, persistent=False)
 
-        # 这些还是参数
-        self.alpha_logit = nn.Parameter(torch.zeros(n_state))
-        self.beta_param = nn.Parameter(torch.ones(n_state) * 0.5)
-        self.theta_param = nn.Parameter(torch.linspace(0, float(np.pi / 4), n_state))
+    def _cos_approx(self, x: Tensor) -> Tensor:
+        # 使用泰勒展开近似 cos(x) ≈ 1 - x^2/2 + x^4/24
+        x2 = x * x
+        x4 = x2 * x2
+        return 1.0 - 0.5 * x2 + (1.0 / 24.0) * x4
 
-        # 需要“往上”补多少步（时间维前置零）
-        self.pad_top = int(kernel_size - 1)
+    def forward(self, x: Tensor, alpha: Tensor, beta: Tensor, theta: Tensor) -> Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
 
-        # 真正的深度卷积，不带 padding
-        self.conv = nn.Conv2d(
-            in_channels=n_state,
-            out_channels=n_state,
-            kernel_size=(kernel_size, 1),
-            padding=(0, 0),
-            groups=n_state,
-            bias=False,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, C, T, 1)
         B, C, T, _ = x.shape
-        assert C == self.n_state
+        t_idx = self.time_indices.to(dtype=x.dtype, device=x.device)
 
-        # 动态生成一套核并塞到 conv 里
-        alpha = torch.sigmoid(self.alpha_logit).clamp(1e-4, 1 - 1e-4).to(x.dtype)
-        beta  = F.softplus(self.beta_param).to(x.dtype)
-        theta = self.theta_param.to(x.dtype)
+        alpha = alpha.view(1, C, 1).to(dtype=x.dtype, device=x.device)
+        beta = beta.view(1, C, 1).to(dtype=x.dtype, device=x.device)
+        theta = theta.view(1, C, 1).to(dtype=x.dtype, device=x.device)
 
-        h = torch.arange(self.kernel_size, device=x.device, dtype=x.dtype)
-        decay = torch.pow(alpha.unsqueeze(1), h.unsqueeze(0))
-        phase = torch.cos(h.unsqueeze(0) * theta.unsqueeze(1))
-        kernel = beta.unsqueeze(1) * decay * phase              # (C,K)
-        weight = kernel.view(C, 1, self.kernel_size, 1)
-        self.conv.weight = nn.Parameter(weight, requires_grad=True)
+        log_alpha = torch.log(alpha.clamp(min=1e-6))
+        decay = torch.exp(log_alpha * t_idx)                 # (1,C,K)
+        phase = self._cos_approx(theta * t_idx)              # (1,C,K)
+        kernel = (beta * decay * phase).view(C, 1, self.kernel_size)
 
-        # 使用静态 F.pad，导出为固定 pads 的 Pad 节点（Hailo 友好）
-        if self.pad_top > 0:
-            x = F.pad(x, (0, 0, int(self.pad_top), 0))  # (left,right,top,bottom)
+        x_1d = x.squeeze(-1)
+        x_padded = F.pad(x_1d, (self.kernel_size - 1, 0))
+        y = F.conv1d(x_padded, kernel, groups=C)
+        return y.unsqueeze(-1)
 
-        y = self.conv(x)            # (B,C,T,1)
-
-        return y
+class Conv1x1NoUnsqueeze(nn.Conv2d):
+    def forward(self, x):
+        # 强制 weight 为 buffer，不走参数路径 → 不触发 Constant→Unsqueeze
+        weight = self.weight
+        bias = self.bias
+        return F.conv2d(x, weight, bias)
 
 class MultiHeadAttention(nn.Module):
     """
@@ -188,11 +206,9 @@ class MultiHeadAttention(nn.Module):
             return self.out(out)
 
     def _self_attention_kernel(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        B = 1
-        T = 1500
-        C = 512
-        H = 8
-        Dh = 64
+        B, C, T, _ = q.shape
+        H = self.n_head
+        Dh = C // H
 
         # 1) 核映射 + 分头
         phi_q = self.phi(q).reshape(B, H, Dh, T, 1)
@@ -216,11 +232,10 @@ class MultiHeadAttention(nn.Module):
     
     def _cross_attention_linear(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         B, C, Tq, _ = q.shape
-        _, Ck, Tk, _ = k.shape
-
+        _, _, Tk, _ = k.shape
         H = self.n_head
-        Dh = self.d_head
-
+        Dh = C // H
+        
         phi_q = self.phi(q).reshape(B, H, Dh, Tq, 1)
         phi_k = self.phi(k).reshape(B, H, Dh, Tk, 1)
         v = v.reshape(B, H, Dh, Tk, 1)
@@ -330,26 +345,59 @@ class MambaLikeBlock4D(nn.Module):
         self.ssm = SSM4D(n_state, kernel_size=ssm_kernel)
         self.out_proj = Linear(n_state, n_state)
 
+        self.register_parameter(
+            "alpha",
+            nn.Parameter(torch.full((n_state,), 0.9, dtype=torch.float32))
+        )
+        self.register_parameter(
+            "beta",
+            nn.Parameter(torch.full((n_state,), 0.5, dtype=torch.float32))
+        )
+        theta_init = torch.linspace(0, math.pi / 4, n_state, dtype=torch.float32)
+        self.register_parameter("theta", nn.Parameter(theta_init))
+
+    def set_ssm_parameters(self, alpha: Tensor, beta: Tensor, theta: Tensor) -> None:
+        with torch.no_grad():
+            self.alpha.copy_(alpha.to(self.alpha.device, dtype=self.alpha.dtype))
+            self.beta.copy_(beta.to(self.beta.device, dtype=self.beta.dtype))
+            self.theta.copy_(theta.to(self.theta.device, dtype=self.theta.dtype))
+
     def forward(self, x: Tensor) -> Tensor:
+        # x: (B,def forward(self, x: Tensor) -> Tensor:
         # x: (B, C, T, 1)
         B, C, T, _ = x.shape
 
+        # ---- 前层标准处理 ----
         h = self.ln(x)
-        h = self.in_proj(h)         # (B,2C,T,1)
+        h = self.in_proj(h)  # (B,2C,T,1)
 
-        # 因果“补齐” → depthwise（使用静态 F.pad 生成 Pad 节点，pads 为常量）
+        # 因果 pad：静态常数，避免动态 If/Pad
         if self.pad_top > 0:
             h = F.pad(h, (0, 0, int(self.pad_top), 0))  # (B,2C,T+pad_top,1)
-        h = self.d_conv(h)          # (B,2C,T,1)
+        h = self.d_conv(h)  # (B,2C,T,1)
 
-        # 拆两半
-        h_content, h_gate = torch.split(h, C, dim=1)
+        # ---- 拆两半 ----
+        h_content = h[:, :C, :, :]
+        h_gate    = h[:, C:, :, :]
 
+        # ---- SSM 路径 ----
         h_content = F.silu(h_content)
-        h_ssm = self.ssm(h_content)
-        gate = torch.sigmoid(h_gate)
-        h_sel = h_ssm * gate
+        alpha = self.alpha.to(dtype=h_content.dtype, device=h_content.device)
+        beta  = self.beta .to(dtype=h_content.dtype, device=h_content.device)
+        theta = self.theta.to(dtype=h_content.dtype, device=h_content.device)
+        h_ssm = self.ssm(h_content, alpha, beta, theta)  # (B,C,T,1)
 
+        # ---- Gate 路径 ----
+        gate = torch.sigmoid(h_gate).to(dtype=h_ssm.dtype)  # (B,C,T,1)
+
+        # ==== 🔒 关键部分 ====
+
+        # 1. 用 Add(0) “锚定”两条路径，防止 Hailo 把 Unsqueeze / Shape 折叠掉
+        h_ssm = h_ssm + x * 1e-9
+        gate  = gate  + x * 1e-9
+        h_sel = torch.mul(h_ssm.clone(), gate.clone())
+
+        # ---- 输出投影 + 残差 ----
         h_out = self.out_proj(h_sel)
         return x + h_out
 
@@ -364,21 +412,27 @@ class ResidualMambaCrossBlock(nn.Module):
         super().__init__()
         self.mamba = MambaLikeBlock4D(n_state, d_conv=d_conv, ssm_kernel=ssm_kernel)
         self.cross_attn = MultiHeadAttention(n_state, n_head)
-        self.cross_ln = LayerNorm(n_state)
+        self.cross_ln = LayerNorm4D(n_state)   # ← 用我们刚写的这个
 
         n_mlp = n_state * 4
         self.mlp = nn.Sequential(
             Linear(n_state, n_mlp), nn.SiLU(), Linear(n_mlp, n_state)
         )
-        self.mlp_ln = LayerNorm(n_state)
+        self.mlp_ln = LayerNorm4D(n_state)
+
+    def set_ssm_parameters(self, alpha: Tensor, beta: Tensor, theta: Tensor) -> None:
+        self.mamba.set_ssm_parameters(alpha, beta, theta)
 
     def forward(self, x: Tensor, xa: Tensor) -> Tensor:
         # Mamba 自身路径（内部自带残差）
         x = self.mamba(x)
+        x = x + x * 1e-9
         # 交叉注意力 + 残差
         x = x + self.cross_attn(self.cross_ln(x), xa)
+        x = x + x * 1e-9
         # MLP + 残差
         x = x + self.mlp(self.mlp_ln(x))
+        x = x + x * 1e-9
         return x
 
 class Decoder(nn.Module):
@@ -396,25 +450,40 @@ class Decoder(nn.Module):
         self.n_ctx = n_ctx
 
         # 替换 nn.Embedding 为 nn.Conv2d
-        self.token_proj = nn.Conv2d(n_vocab, n_state, kernel_size=1, bias=False)
+        self.token_proj = Conv1x1NoUnsqueeze(n_vocab, n_state, kernel_size=1, bias=False)
 
         self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
         nn.init.normal_(self.positional_embedding, mean=0.0, std=0.02)
 
-        self.out_proj = nn.Conv2d(
-            in_channels=n_state,
-            out_channels=n_vocab,
-            kernel_size=1,
-            bias=False
-        )
+        self.out_proj = Conv1x1NoUnsqueeze(n_state, n_vocab, kernel_size=1, bias=False)
 
         self.blocks = nn.ModuleList([
             ResidualMambaCrossBlock(n_state, n_head, d_conv=d_conv, ssm_kernel=ssm_kernel)
             for _ in range(n_layer)
         ])
-        self.ln = LayerNorm(n_state)
+        self.ln = LayerNorm4D(n_state)
 
         self.n_vocab = n_vocab
+
+        # whisper_hailo_model.py 里的 Decoder.__init__ 增加这几行
+        self.fixed_B = 1
+        self.fixed_C = n_state
+        self.fixed_T = n_ctx  # 导出时是固定的 448
+        # 常量 shape，作为 Reshape 的静态 shape initializer
+        self.register_buffer(
+            "text_shape_4d",
+            torch.tensor([self.fixed_B, self.fixed_C, self.fixed_T, 1], dtype=torch.int64),
+            persistent=False
+        )
+
+    def set_ssm_parameters(self, alphas: Tensor, betas: Tensor, thetas: Tensor) -> None:
+        if alphas.shape[0] != len(self.blocks):
+            raise ValueError("alphas length must match number of decoder blocks")
+        if betas.shape[0] != len(self.blocks) or thetas.shape[0] != len(self.blocks):
+            raise ValueError("betas/thetas length must match number of decoder blocks")
+
+        for i, block in enumerate(self.blocks):
+            block.set_ssm_parameters(alphas[i], betas[i], thetas[i])
 
     def forward(self, onehot: Tensor, xa: Tensor) -> Tensor:
         """
@@ -427,13 +496,10 @@ class Decoder(nn.Module):
         B, V, Tt, _ = onehot.shape
         if xa.dim() != 4:
             raise ValueError("xa should be 4D (B,C,T,1)")
-
-        # 1) 直接 one-hot 进入 embedding
-        x = self.token_proj(onehot)   # (B, C, T, 1)
-
-        # 2) 加上位置编码 (已是 (B,C,T,1) 形状，不需要 permute)
-        pos = self.positional_embedding[:Tt, :].T.unsqueeze(0).unsqueeze(-1)  # (1,C,T,1)
-        x = (x + pos).to(xa.dtype)  # (B,C,T,1)
+        
+        x = self.token_proj(onehot)           # (B,C,T,1)
+        pos = self.positional_embedding[:Tt, :].T[None, :, :].unsqueeze(-1)  # (1,C,T,1)
+        x = (x + pos).to(xa.dtype)
 
         # 3) 多层解码块
         for block in self.blocks:
