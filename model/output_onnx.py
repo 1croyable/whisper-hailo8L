@@ -7,22 +7,17 @@ from model.whisper_hailo_model import WhisperHailoModel, ModelDimensions
 dem = ModelDimensions()
 dem.n_mels = 80
 dem.n_audio_ctx = 1000
-dem.n_audio_state = 512
+dem.n_audio_state = 768
 dem.n_audio_head = 8
 dem.n_audio_layer = 12
 dem.n_vocab = 51865
 dem.n_text_ctx = 500
-dem.n_text_state = 512
+dem.n_text_state = 768
 dem.n_text_head = 8
 dem.n_text_layer = 6
 
 model = WhisperHailoModel(dem)
 model.eval()
-
-# weights_path = "model/student_ctc_kd.pth.epoch0"
-# sd = torch.load(weights_path, map_location="cpu")
-# model.load_state_dict(sd, strict=False)
-# print(f"[INFO] Loaded weights from {weights_path}")
 
 dummy_mel = torch.randn(1, dem.n_mels, dem.n_audio_ctx, 1, dtype=torch.float32)
 # 调整 onehot 的形状以匹配 Conv2d 的输入要求
@@ -38,31 +33,31 @@ thetas = torch.linspace(0, np.pi / 4, n_state, dtype=torch.float32).repeat(n_lay
 
 model.decoder.set_ssm_parameters(alphas, betas, thetas)
 
-# encoder_onnx_path = "whisper-hailo8l-encoder.onnx"
-# torch.onnx.export(
-#     model.encoder,
-#     dummy_mel,
-#     encoder_onnx_path,
-#     input_names=["mel"],
-#     output_names=["audio_features"],
-#     dynamic_axes=None,
-#     do_constant_folding=True,
-#     keep_initializers_as_inputs=False,
-#     opset_version=12
-# )
-# print(f"[SUCCESS] Exported encoder to {encoder_onnx_path}")
-
-decoder_onnx_path = "whisper-hailo8l-decoder.onnx"
+encoder_onnx_path = "whisper-hailo8l-encoder.onnx"
 torch.onnx.export(
-    model.decoder,
-    (dummy_onehot, model.encoder(dummy_mel)),
-    decoder_onnx_path,
-    input_names=["onehot", "xa"],
-    output_names=["decoder_output"],  # 用 graph.output 名
+    model.encoder,
+    dummy_mel,
+    encoder_onnx_path,
+    input_names=["mel"],
+    output_names=["audio_features"],
     dynamic_axes=None,
     do_constant_folding=True,
     keep_initializers_as_inputs=False,
-    opset_version=14,
-    training=torch.onnx.TrainingMode.PRESERVE
+    opset_version=12
 )
-print("[SUCCESS] Exported decoder to", decoder_onnx_path)
+print(f"[SUCCESS] Exported encoder to {encoder_onnx_path}")
+
+# decoder_onnx_path = "whisper-hailo8l-decoder.onnx"
+# torch.onnx.export(
+#     model.decoder,
+#     (dummy_onehot, model.encoder(dummy_mel)),
+#     decoder_onnx_path,
+#     input_names=["onehot", "xa"],
+#     output_names=["decoder_output"],  # 用 graph.output 名
+#     dynamic_axes=None,
+#     do_constant_folding=True,
+#     keep_initializers_as_inputs=False,
+#     opset_version=14,
+#     training=torch.onnx.TrainingMode.PRESERVE
+# )
+# print("[SUCCESS] Exported decoder to", decoder_onnx_path)

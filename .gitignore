@@ -11,6 +11,10 @@ model/assets/manifest.tsv
 model/student_ctc_kd.pth.epoch*
 model/*.pth
 
+train-resullt/
+olds/
+train/
+
 # 缓存和中间结果
 __pycache__/
 *.log
