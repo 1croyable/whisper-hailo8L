@@ -486,28 +486,24 @@ class Decoder(nn.Module):
             block.set_ssm_parameters(alphas[i], betas[i], thetas[i])
 
     def forward(self, onehot: Tensor, xa: Tensor) -> Tensor:
-        """
-        onehot: (B, V, T, 1)  # 外部传入的 one-hot
-        xa: 编码器输出 (B, C, T_audio, 1)
-        返回: logits (B, n_vocab, T_text, 1)
-        """
         if onehot.dim() != 4:
             raise ValueError("onehot should be (B,V,T,1)")
         B, V, Tt, _ = onehot.shape
         if xa.dim() != 4:
             raise ValueError("xa should be 4D (B,C,T,1)")
         
-        x = self.token_proj(onehot)           # (B,C,T,1)
-        pos = self.positional_embedding[:Tt, :].T[None, :, :].unsqueeze(-1)  # (1,C,T,1)
+        x = self.token_proj(onehot)
+        pos = self.positional_embedding[:Tt, :].T[None, :, :].unsqueeze(-1)
+        pos = pos.to(dtype=x.dtype, device=x.device)
         x = (x + pos).to(xa.dtype)
 
-        # 3) 多层解码块
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x, xa)
 
-        # 4) 输出层归一化 + 投影
-        x = self.ln(x)            # (B,C,T,1)
-        logits = self.out_proj(x) # (B,V,T,1)
+        x = self.ln(x)            
+
+        logits = self.out_proj(x) 
+
         return logits
     
 class WhisperHailoModel(nn.Module):
