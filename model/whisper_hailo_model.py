@@ -298,12 +298,13 @@ class AudioEncoder(nn.Module):
     def forward(self, x: Tensor, pos_emb: Optional[Tensor] = None) -> Tensor:
         # 使用静态 F.pad 替代 conv 的对称 padding，避免 Hailo 自动拆 padding
         # conv1: kernel=(3,1), 期望对称 pad 1 → 使用 F.pad pads=(0,0,1,1)
+        # 输入是 B x 80 x 1000 x 1
         x = F.pad(x, (0, 0, 1, 1))
-        x = F.silu(self.conv1(x))
+        x = F.silu(self.conv1(x)) # B x 80 x 1000 x 1 -> B x 768 x 1000 x 1
 
         # conv2: kernel=(3,1), stride=(2,1), 对称 pad 1
         x = F.pad(x, (0, 0, 1, 1))
-        x = F.silu(self.conv2(x))  # (B, n_state, T/2, 1)
+        x = F.silu(self.conv2(x))  # B x 768 x 1000 x 1 -> B x 768 x 500 x 1
 
         if pos_emb is not None:
             # 截到同样的时间长度
