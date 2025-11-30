@@ -58,24 +58,6 @@ class Linear(nn.Module):
 
         return F.conv2d(x, self.weight, self.bias)
 
-class LayerNorm(nn.Module):
-    """
-    (B, C, T, 1) 输入的 LayerNorm 等价形式 (GroupNorm 实现)。
-    使用 GroupNorm(1, C) 在样本内部跨所有通道做归一化。
-    """
-    def __init__(self, n_state: int, eps: float = 1e-5):
-        super().__init__()
-        self.norm = nn.GroupNorm(1, n_state, eps=eps, affine=True)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        x: (B, C, T, 1)
-        return: (B, C, T, 1)
-        """
-        if x.dim() != 4:
-            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
-        return self.norm(x)
-
 class LayerNorm4D(nn.Module):
     """
     Hailo-friendly LN for (B, C, T, 1)
@@ -167,6 +149,7 @@ class Conv1x1NoUnsqueeze(nn.Conv2d):
         bias = self.bias
         return F.conv2d(x, weight, bias)
 
+# endocer
 class MultiHeadAttention(nn.Module):
     """
     4D版本多头注意力，保持 (B, C, T, 1)
@@ -253,6 +236,26 @@ class MultiHeadAttention(nn.Module):
         out = out / torch.sqrt(torch.tensor(Dh, dtype=out.dtype, device=out.device))
         return out
 
+# endocer
+class LayerNorm(nn.Module):
+    """
+    (B, C, T, 1) 输入的 LayerNorm 等价形式 (GroupNorm 实现)。
+    使用 GroupNorm(1, C) 在样本内部跨所有通道做归一化。
+    """
+    def __init__(self, n_state: int, eps: float = 1e-5):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, n_state, eps=eps, affine=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (B, C, T, 1)
+        return: (B, C, T, 1)
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input (B,C,T,1), got {x.shape}")
+        return self.norm(x)
+
+# endocer
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
@@ -274,6 +277,7 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
+# endocer
 class AudioEncoder(nn.Module):
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
         super().__init__()

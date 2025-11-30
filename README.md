@@ -1,20 +1,39 @@
-# whisper-hailo8L
-Ce projet concerne l’application du modèle Whisper à Raspberry Pi5 et hailo8L
+👉中文版本，[Version Française](README_FR.md)
 
-## Plan de déroulement(par étapes)
+# Whisper-Hailo8L 项目阶段性总结
 
-### > Étape 1 – Analyse du modèle Whisper original
+### 项目目标
 
-Comprendre la structure mathématique exacte du modèle OpenAI Whisper.
+本项目的长期目标，是让 Whisper 在 Raspberry Pi 5 加 Hailo-8L 的组合上实现实时语音识别。因此，整个工程并不是简单地把 Whisper 量化，而是必须重建一套完全兼容硬件结构的 Encoder，再把 Whisper 的知识通过蒸馏的方式迁移进来。这使得项目本质上变成了“构建一个 Hailo 友好的 Whisper-Lite”，而不是简单的推理部署。
 
-### > Étape 2 – Étude du matériel Hailo-8L
+### 编码器解码器设计
 
-Comprendre les contraintes et capacités du matériel.
+**编码器**
 
-### > Étape 3 – Conception d’une version “Whisper-Lite”
+在最初的方案中，我选择自行设计一个线性注意力的编码器，希望用 kernel attention 来代替原来的自注意力，以减少softmax以及点积操作，这些结构对 Hailo 来说是比较困难的。编码器的前两层卷积结构也进行了调整，最终输出的时序长度固定为 500 帧，而不是 Whisper-small 的 1500 帧。这个差异虽然在 PyTorch 下能工作，但在蒸馏过程中造成了一个结构性的问题：因为上下文长度改变，Whisper 原本的时间位置编码与我的模型已经不对齐。蒸馏时我强行让学生模型去拟合老师模型的 latent 表达，结果学生模型实际上在“学习被截断的注意力”，因此蒸馏过程虽然能收敛，但得到的编码器并不能真正保持 Whisper 的表达方式。
 
-Adapter Whisper pour être compatible avec Hailo.
+当我尝试把这个编码器迁移到 Hailo 上时，问题进一步暴露。Hailo 的编译器在处理某些算子时会主动修改计算图，比如 LayerNorm 会被拆成 GroupNorm 和 reshape，kernel attention 的分母和加权过程会被重新组织，有些 padding 会被剪裁，reshape 可能被合并或删除。经过量化后，最终的图结构已经不是我在 PyTorch 里训练的那个模型，因此推理结果与原版本偏差很大。特别是在量化阶段出现过动辄数百 GB 的内存占用，说明这个结构对于 Hailo 的图优化来说非常不友好。
 
-### > Étape 4 – Compilation et tests sur Hailo-8L
+**解码器**
 
-À ce stade, nous devrons peut-être réentraîner le modèle nouvellement construit. Je pourrais d’abord récupérer les données audio en français, ce qui rendrait le modèle plus léger
+解码器部分的问题更为明显。我先尝试过 CTC 解码，但 CTC 本身无法学习语言上下文，而且训练过程中倾向输出大量 blank token，这一点与 Whisper 的强语言建模能力完全不相符。
+
+随后我尝试了 Mamba 和 SSM 的结构，希望利用其卷积化、递归式的特性来规避自回归带来的注意力计算。然而 Mamba 的理论基础依赖“无限长度卷积核”，在 Hailo 上必须强行把卷积长度固定为一个有限值，这等于是把一个本质上是递归结构的模型，拉扁成了一个固定形状卷积，从数学上已经失真，图结构也无法保持稳定。量化之后模型的行为与训练时完全对不上。
+
+到了 cross-attention 部分问题更加严重。即便我尝试将 softmax 替换为核函数，QK 的矩阵乘法仍然需要做 shape 对齐，而一旦需要 padding 或 broadcast，Hailo 就会自动修改图，从而造成后续所有操作都不再与原模型一致。这意味着无论如何近似，基于注意力的解码器都不可能在 Hailo 上安全实现。
+
+**暂时先尝试把编码器做转化，解码器留在cpu上**
+
+综合这些现象，我意识到解码器不适合被部署在 NPU 上，它本质上应该留在 CPU 或 GPU 上执行，而 Hailo 只负责 Encoder。这实际上也是 Whisper 的自然划分方式：编码器负责音频特征提取，解码器负责语言建模。把语言部分留给 CPU，并不会损害实时性。
+
+### 未来方向
+
+因此，项目的下一阶段需要回到编码器本身。必须重新设计一套完全符合 Hailo 运算图规范的结构，输入长度和输出时序必须与 Whisper-small 完全一致，最好保持 1500 帧的结构不变。
+同时，编码器内部不应该出现会被编译器重写的结构。我需要更多依赖卷积、DepthwiseConv、GroupNorm、逐点乘加这样的算子，而尽量避免 reshape、动态广播和不规则求和这些操作。这个方向更接近 YOLO 系列的网络结构，也更符合嵌入式 NPU 的设计原则
+最终目标是构建一个数学上稳定、形状固定，并能完全通过蒸馏继承 Whisper 编码器知识的 Hailo-Friendly Encoder。
+
+在编码器重建完成后，我会按老样子，先导出成onnx，再尝试变成haf格式，如果通过了转化步骤，基本上量化和编译也能通过，然后再去做Whisper的蒸馏训练，输出的结果用在whisper本身的decoder上看结果。
+
+至于工程方面，目前，我成功构建了数据生成管线，通过 gRPC 可以稳定地从 Hailo 获得 encoder output （注意力向量），并已生成5万条数据用于 decoder 学习。这部分是成功的。问题的核心现在集中在“编码器的结构设计”和“蒸馏时必须保持与 Whisper 上下文一致”这两个方面。未来的工作重点，将是重新设计编码器的结构，使其能在 Hailo 上保持图结构不变，同时又能完整学习 Whisper 编码器的表达能力，最终实现真正意义上的“Whisper 语音编码器 on Hailo”。
+
+（注：Hailo complier的流程是转化、量化、编译，尽管量化步骤也是一大问题，hailo会在底层生成不必要的内容，我们当时编译老版本enocder就遇到了问题后来我绕开了noisy检测才得以通过。当时在量化结束后准备编译成hef格式，decoder.har编译失败，这也是一个问题，不过我们的decoder的图结构确实复杂，现在暂时撤退，先研究encoder）
