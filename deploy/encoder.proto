@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package encoder;
+
+message EncodeRequest {
+  bytes mel = 1;
+  int32 batch_size = 2; // B
+}
+
+message EncodeResponse {
+  bytes xa = 1;
+}
+
+message DecodeRequest {
+    bytes mel = 1;
+    int32 batch_size = 2;
+}
+
+message DecodeResponse {
+    string text = 1;
+}
+
+service Encoder {
+    rpc Encode(EncodeRequest) returns (EncodeResponse);
+    rpc EncodeAndDecode(DecodeRequest) returns (DecodeResponse);
+}

@@ -435,7 +435,7 @@ class ResidualMambaCrossBlock(nn.Module):
         x = x + self.mlp(self.mlp_ln(x))
         x = x + x * 1e-9
         return x
-
+    
 class Decoder(nn.Module):
     """
     基于 Mamba 自注意 + 交叉注意力 的解码器，实现与 Whisper 类似的结构：
@@ -449,13 +449,16 @@ class Decoder(nn.Module):
         super().__init__()
         self.n_state = n_state
         self.n_ctx = n_ctx
+        self.n_vocab = n_vocab
 
-        # 替换 nn.Embedding 为 nn.Conv2d
-        self.token_proj = Conv1x1NoUnsqueeze(n_vocab, n_state, kernel_size=1, bias=False)
+        # 训练时的 token embedding
+        self.token_emb = nn.Embedding(n_vocab, n_state)
 
+        # 训练时的可学习位置向量
         self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
         nn.init.normal_(self.positional_embedding, mean=0.0, std=0.02)
 
+        # 训练时的输出到 vocab（部署的时候可以只在 CPU 用）
         self.out_proj = Conv1x1NoUnsqueeze(n_state, n_vocab, kernel_size=1, bias=False)
 
         self.blocks = nn.ModuleList([
@@ -464,13 +467,10 @@ class Decoder(nn.Module):
         ])
         self.ln = LayerNorm4D(n_state)
 
-        self.n_vocab = n_vocab
-
-        # whisper_hailo_model.py 里的 Decoder.__init__ 增加这几行
+        # 固定 4D shape（给 Hailo encoder 用的，不影响 decoder_core）
         self.fixed_B = 1
         self.fixed_C = n_state
-        self.fixed_T = n_ctx  # 导出时是固定的 448
-        # 常量 shape，作为 Reshape 的静态 shape initializer
+        self.fixed_T = n_ctx
         self.register_buffer(
             "text_shape_4d",
             torch.tensor([self.fixed_B, self.fixed_C, self.fixed_T, 1], dtype=torch.int64),
@@ -482,63 +482,107 @@ class Decoder(nn.Module):
             raise ValueError("alphas length must match number of decoder blocks")
         if betas.shape[0] != len(self.blocks) or thetas.shape[0] != len(self.blocks):
             raise ValueError("betas/thetas length must match number of decoder blocks")
-
         for i, block in enumerate(self.blocks):
             block.set_ssm_parameters(alphas[i], betas[i], thetas[i])
 
-    def forward(self, onehot: Tensor, xa: Tensor) -> Tensor:
-        if onehot.dim() != 4:
-            raise ValueError("onehot should be (B,V,T,1)")
-        B, V, Tt, _ = onehot.shape
-        if xa.dim() != 4:
-            raise ValueError("xa should be 4D (B,C,T,1)")
-        
-        x = self.token_proj(onehot)
+    def forward(self, token_ids: Tensor, xa: Tensor) -> Tensor:
+        """
+        训练/纯 PyTorch 推理时使用：
+        token_ids: (B, T)  int64
+        xa        : encoder features (B, C, T_a, 1)
+        """
+        if token_ids.dim() != 2:
+            raise ValueError("token_ids should be (B, T)")
+
+        B, Tt = token_ids.shape
+
+        # 1) token embedding
+        x = self.token_emb(token_ids)             # (B, T, C)
+        x = x.permute(0, 2, 1).unsqueeze(-1)      # (B, C, T, 1)
+
+        # 2) 加可学习位置向量
         pos = self.positional_embedding[:Tt, :].T[None, :, :].unsqueeze(-1)
         pos = pos.to(dtype=x.dtype, device=x.device)
-        x = (x + pos).to(xa.dtype)
+        x = x + pos
 
-        for i, block in enumerate(self.blocks):
+        # 3) Mamba + CrossAttn + MLP blocks
+        for block in self.blocks:
             x = block(x, xa)
 
-        x = self.ln(x)            
+        x = self.ln(x)
 
-        logits = self.out_proj(x) 
-
+        # 4) 训练时直接输出 logits
+        logits = self.out_proj(x)                 # (B, vocab, T, 1)
         return logits
+
+# class DecoderCore(nn.Module):
+#     """
+#     部署到 Hailo 的精简版 Decoder：
+#     - 不做 token embedding
+#     - 不做位置向量
+#     - 不做 out_proj 到 vocab
+#     只做:
+#     - 多层 (Mamba + CrossAttn + MLP)
+#     - 最后 LayerNorm
+#     输入 x 必须已经是 (embedding + pos) 之后的特征。
+#     """
+#     def __init__(self, decoder: Decoder):
+#         super().__init__()
+#         self.blocks = decoder.blocks
+#         self.ln = decoder.ln
+
+#     def forward(self, x: Tensor, xa: Tensor) -> Tensor:
+#         """
+#         x : (B, C, T, 1)  已经加好 embedding + pos 的特征
+#         xa: (B, C, T_a, 1) encoder 输出
+#         """
+#         if x.dim() != 4:
+#             raise ValueError("x should be (B,C,T,1)")
+#         if xa.dim() != 4:
+#             raise ValueError("xa should be (B,C,T_a,1)")
+
+#         for block in self.blocks:
+#             x = block(x, xa)
+
+#         x = self.ln(x)
+
+#         # 小 hack 防止 Hailo 折叠掉
+#         x = x.clone()
+#         x = x + 0
+#         return x
     
-class WhisperHailoModel(nn.Module):
-    def __init__(self, dims):
-        super().__init__()
-        self.dims = dims
+# class WhisperHailoModel(nn.Module):
+    # def __init__(self, dims):
+    #     super().__init__()
+    #     self.dims = dims
 
-        # 语音编码器
-        self.encoder = AudioEncoder(
-            n_mels=dims.n_mels,
-            n_ctx=dims.n_audio_ctx,
-            n_state=dims.n_audio_state,
-            n_head=dims.n_audio_head,
-            n_layer=dims.n_audio_layer,
-        )
+    #     # 语音编码器
+    #     self.encoder = AudioEncoder(
+    #         n_mels=dims.n_mels,
+    #         n_ctx=dims.n_audio_ctx,
+    #         n_state=dims.n_audio_state,
+    #         n_head=dims.n_audio_head,
+    #         n_layer=dims.n_audio_layer,
+    #     )
 
-        # 文本解码器（Mamba + CrossAttention）
-        self.decoder = Decoder(
-            n_vocab=dims.n_vocab,
-            n_ctx=dims.n_text_ctx,
-            n_state=dims.n_text_state,
-            n_head=dims.n_text_head,
-            n_layer=dims.n_text_layer,
-        )
+    #     # 文本解码器（Mamba + CrossAttention）
+    #     self.decoder = Decoder(
+    #         n_vocab=dims.n_vocab,
+    #         n_ctx=dims.n_text_ctx,
+    #         n_state=dims.n_text_state,
+    #         n_head=dims.n_text_head,
+    #         n_layer=dims.n_text_layer,
+    #     )
 
-    def embed_audio(self, mel: torch.Tensor) -> torch.Tensor:
-        """编码音频特征 -> (B, C, T_audio, 1)"""
-        return self.encoder(mel)
+    # def embed_audio(self, mel: torch.Tensor) -> torch.Tensor:
+    #     """编码音频特征 -> (B, C, T_audio, 1)"""
+    #     return self.encoder(mel)
 
-    def logits(self, onehot: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
-        """解码 logits"""
-        return self.decoder(onehot, audio_features)
+    # def logits(self, onehot: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+    #     """解码 logits"""
+    #     return self.decoder(onehot, audio_features)
 
-    def forward(self, mel: torch.Tensor, onehot: torch.Tensor) -> torch.Tensor:
-        audio_features = self.encoder(mel)
-        logits = self.decoder(onehot, audio_features)
-        return logits
+    # def forward(self, mel: torch.Tensor, onehot: torch.Tensor) -> torch.Tensor:
+    #     audio_features = self.encoder(mel)
+    #     logits = self.decoder(onehot, audio_features)
+    #     return logits
